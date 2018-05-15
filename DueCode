@@ -1,0 +1,826 @@
+/*
+   Retrieve the MAC address from a Microchip 24AA125E48 I2C ROM, and report it
+   to the serial console at 9600. The I2C address of the ROM is set to 0x50,
+   which assumes both the address pins are tied to 0V.
+*/
+#define I2C_ADDRESS 0x50
+#include <Wire.h>
+#include <Scheduler.h>
+#include <SPI.h>
+#include <Ethernet.h>
+#include <stdio.h>
+#include <string.h>
+#include <Kangaroo.h>
+#include <HX711_ADC.h>
+#include <SD.h>
+
+
+
+//---My Hardware Def---- //Defines Hardware Positions
+//-----Pot Start
+int PotHook = A0; //AD2 on Due
+//-----Pot End
+
+//-----My SDcard Start-----
+char  fname[ 14 ] = "test2.txt";
+File  sdfile;
+int count;
+const int chipSelect = 4;
+//-----My SDcard End-----
+
+//---My Hardware End----
+
+
+//----My Server Begin----
+static uint8_t mac[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+String myMac;
+IPAddress MyIp(192, 168, 1, 177);
+int MyPort = 8888;      // local port to listen on
+//----My Server End----
+
+//----MyHardwareConfig---
+int MyConfig = 10001;
+//---My hardware End---
+
+//----My Message Begin----
+String MyMessage; //Entire Messaage
+//int StarChatLen = 8;
+char StartChar[8]; //Message that starts the message 8 char max
+int MachineConfig; //Required Configuration of machine, first level check,Integer
+char UserID[64]; //UserName 64 char max(
+char PubName[32]; //Name to put on cup (Future dev) (first 32 char)
+String Payload; //Drink Making instructions
+String TimeDateInit; //Time/Date Order placement
+char DimChar[4];  //Character that separates various components 4 max
+char TermChar[8]; //Character that terminates the message, 8 max
+//----My Message End----
+
+//----My Status Begin---
+bool Busy = false; //Sets true
+//----My Status End---
+
+
+//----Remote Config-----
+//This is the Raspberry pi, it is a hard coded value.
+IPAddress TargetIp(192, 168, 0, 105);
+int TargetPort = 10001;
+//----Remote Config End
+
+
+//-----TCP Definition Begin-----
+EthernetClient MyClient;
+//-----TCP Definition End-------
+
+
+//-----Position Sample Begin----
+struct ShotPull {
+  char Name[100];
+  int Time;
+  int SampleRate;
+  int Min;
+  int Max;
+  int ShotProfile[1200];
+  bool checksum; //Time*Samples should length of ShotProfile
+};
+ShotPull Current_Setting;
+//-----Position Sample End------
+
+//-----Kangaroo Set Up Start----
+#define TX_PIN 11
+#define RX_PIN 10
+// Independent mode channels on Kangaroo are, by default, '1' and '2'.
+KangarooSerial  K(Serial3);
+KangarooChannel K1(K, '1');
+//-----Kangaroo Set Up End----
+
+//-----Weight sensor Start----
+#define calibration_factor -7050.0 //This value is obtained using the SparkFun_HX711_Calibration sketch
+#define DOUT  3  //Weight Sensor TBD
+#define CLK  2  //Weight Sensor TBD
+HX711_ADC LoadCell(DOUT, CLK);  //Defines Scale Directly Above Grouphead
+long t; //Time Between weight measures
+//----Weight Sensor End------
+
+//-----Safety Start----------
+String CommandString = "";
+boolean Safe_ToBrew = false;
+float   Safe_Force = 1000;
+boolean Safe_ForceInRange = false;
+boolean Safe_Engaged = false;
+boolean Block = false;
+//-----SafetyEnd-------------
+
+
+//-----------Initialization function-----------------------------------
+void serialInit()
+{
+  SerialUSB.begin(38400);
+  SerialUSB.println("SerialUSB Init");
+  while (!SerialUSB) {
+    ; // wait for serial port to connect. Needed for native USB port only
+  }
+  SerialUSB.println("Serial Init");
+}
+void macInit()
+{
+
+  Wire.begin();         // Join i2c bus (I2C address is optional for the master)
+  for (int i = 0; i < 30; i++)
+  {
+    SerialUSB.println(" ");
+  }
+  SerialUSB.println("Starting test for MAC address ROM");
+  SerialUSB.print("Getting MAC: ");
+  mac[0] = readRegister(0xFA);
+  mac[1] = readRegister(0xFB);
+  mac[2] = readRegister(0xFC);
+  mac[3] = readRegister(0xFD);
+  mac[4] = readRegister(0xFE);
+  mac[5] = readRegister(0xFF);
+  char tmpBuf[17];
+  sprintf(tmpBuf, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  myMac = tmpBuf;
+  SerialUSB.println(myMac);
+  SerialUSB.println(" TEST OK");
+  //Serial.end();
+}
+void initIpAddress()
+{
+  SerialUSB.println("Finding Ip Address");
+  if (Ethernet.begin(mac) == 0)
+  {
+    SerialUSB.println("Failed to configure Ethernet using DHCP, Please Retry");
+    // no point in carrying on, so do nothing forevermore:
+    for (;;)
+      ;
+  }
+  printIPAddress();
+}
+byte readRegister(byte r)
+{
+  unsigned char v;
+  Wire.beginTransmission(I2C_ADDRESS);
+  Wire.write(r);  // Register to read
+  Wire.endTransmission();
+
+  Wire.requestFrom(I2C_ADDRESS, 1); // Read a byte
+  while (!Wire.available())
+  {
+    // Wait
+  }
+  v = Wire.read();
+  return v;
+}
+//-------------------Command Start-------------------------
+void ProbeSerial()
+{
+  if (!Block)
+  {
+    while (SerialUSB.available() > 0)
+    {
+      // read the incoming byte:
+      char NewChar = SerialUSB.read();
+      if (NewChar == '!')
+      {
+        CommandString = "";
+      }
+      else
+      {
+        CommandString += NewChar;
+      }
+    }
+  }
+  yield();
+}
+
+//--------------------Command End--------------------------
+//--------------------Status Checkers----------------------
+void ipStatusCheck() {
+  delay(10000);
+  switch (Ethernet.maintain())
+  {
+    case 1:
+      //renewed fail
+      SerialUSB.println("Error: renewed fail");
+      yield();
+      break;
+
+    case 2:
+      //renewed success
+      SerialUSB.println("DHCP:Renewed success");
+
+      //print your local IP address:
+      printIPAddress();
+      yield();
+      break;
+
+    case 3:
+      //rebind fail
+      SerialUSB.println("Error:DHCP:rebind fail");
+      yield();
+      break;
+
+    case 4:
+      //rebind success
+      SerialUSB.println("DHCP:Rebind success");
+
+      //print your local IP address:
+      printIPAddress();
+      yield();
+      break;
+
+    default:
+      SerialUSB.println("DHCP:Status is good");
+      yield();
+      //nothing happened
+      break;
+
+  }
+}
+void printIPAddress()
+{
+  delay(1000);
+  SerialUSB.print("My IP address: ");
+  for (byte thisByte = 0; thisByte < 4; thisByte++) {
+    // print the value of each byte of the IP address:
+    SerialUSB.print(Ethernet.localIP()[thisByte], DEC);
+    SerialUSB.print(".");
+  }
+  SerialUSB.println();
+  yield();
+}
+
+
+//----TCP Setup Begin-----
+void tcpClientConnect()
+{
+  SerialUSB.println("TCP Client:Check TCP status");
+  if (!MyClient.connected())//If it is not connected
+  {
+    //SerialUSB.println("TCP Client:Attempting to Connect To Server");
+    //SerialUSB.println("TCP Client:Client is Waiting");
+    switch (MyClient.connect(TargetIp, TargetPort))
+    {
+      case 1:
+        //Success
+      //  SerialUSB.println("TCP Client:ReConnected to TargetIP and Target Port");
+        break;
+      case -1:
+        //Time out
+        //SerialUSB.println("TCP Client:Error:Timed Out Connection to Server");
+        break;
+      case -2:
+        //Time out
+        //SerialUSB.println("TCP Client:Error:Invalid Server");
+        break;
+      case -3:
+        //Time out
+        //SerialUSB.println("TCP Client:Error:Truncated");
+        break;
+      case -4:
+        //Time out
+        //SerialUSB.println("TCP Client:Error:Invalid Response");
+        break;
+    }
+    //SerialUSB.println("TCP Client:Completed Status Update");
+  }
+  if (MyClient.connected())//If it is  connected
+  {
+    //SerialUSB.println("TCP Client:TCP Connected");
+  }
+  yield();
+  delay(50.0);
+}
+void tcpClientStatus()
+{
+  //SerialUSB.println("TCP Client:Probing Status");
+  if (!MyClient.connected())//If it is not connected
+  {
+    SerialUSB.println("TCP Client:Client is Waiting");
+    switch (MyClient.connect(TargetIp, TargetPort))
+    {
+      case 1:
+        //Success
+        SerialUSB.println("TCP Client:ReConnected to TargetIP and Target Port");
+        break;
+      case -1:
+        //Time out
+        SerialUSB.println("TCP Client:Error:Timed Out Connection to Server");
+        break;
+      case -2:
+        //Time out
+        SerialUSB.println("TCP Client:Error:Invalid Server");
+        break;
+      case -3:
+        //Time out
+        SerialUSB.println("TCP Client:Error:Truncated");
+        break;
+      case -4:
+        //Time out
+        SerialUSB.println("TCP Client:Error:Invalid Response");
+        break;
+    }
+    SerialUSB.println("TCP Client:Completed Status Update");
+  }
+  //SerialUSB.println("TCP Client:Status:SS:Good");
+  yield();
+  delay(5.0);
+}
+
+//---TCP Setup End-------
+
+//-----TCP Functions Begin----
+void tcpSend(String sendMessage)  //Prints whole message
+{
+  MyClient.print(sendMessage); //Prints message
+  MyClient.flush(); //Waits til end of message send
+}
+void tcpReceive()
+{
+  //SerialUSB.println("TCP Receive:Waiting on Message");
+  while (MyClient.available()) {
+    SerialUSB.println("TCP Receive:Message Available");
+    char add = MyClient.read();
+    if (add == '!')
+    {
+      tcpFinalize(MyMessage);
+      MyMessage = "";
+    }
+    else
+    {
+      MyMessage += add;
+    }
+  }
+  //If Find text is found and theres nothing available in MyClinet & the terminator is at the end
+  // if the server's disconnected, stop the client:
+  if (!MyClient.connected()) {
+    SerialUSB.println("TCPReceive:Error:Server Has Disconnected Attempting Reconnect");
+    MyClient.stop();
+    tcpClientConnect();
+  }
+  //SerialUSB.println("TCP Receive:Cycling");
+  yield();
+}
+void tcpFinalize(String Message)
+{
+  tcpSend(Message);
+}
+//---TCP Functions End-----
+
+
+//---Message Processing Functions----
+
+//---Message Processing Functions----
+
+//---Kangroo Pot Reader Begin----------------
+void InitMotor()
+{
+  SerialUSB.println("InitMotor: Started");
+  Serial3.begin(9600); //Up to higher rates from 9600
+  K1.start();
+  SerialUSB.println("InitMotor: Completed");
+}
+void InitSD()
+{
+  byte flag = SD.begin(chipSelect); // test if card is recognized
+  //fname[ 14 ]; // even # of bytes big enough to hold 8.3 filename and terminator
+  //strcpy( fname, "test.txt" );
+  SerialUSB.print( F("SD card status " ));
+  SerialUSB.print( flag, DEC ); // show success as 1, fail as 0
+  if ( !flag )
+  {
+    SerialUSB.println( F( " Failed to recognize SD card. Goodbye." ));
+    while ( 1 );   // if fail then sketch ends
+  }
+  else
+  {
+    SerialUSB.println( F( " is good to go." ));
+  }
+}
+
+//---Weight Overlay Begin--------------------
+void InitLoadCell()
+{
+  SerialUSB.println("Load Cell Init: Begin");
+  LoadCell.begin();
+  long stabilisingtime = 2000; // tare preciscion can be improved by adding a few seconds of stabilising time
+  LoadCell.start(stabilisingtime);
+  LoadCell.setCalFactor(calibration_factor); // user set calibration factor (float)
+  SerialUSB.println("Load Cell Init: End");
+}
+float GetForce()
+{
+  float i = LoadCell.getData();
+  return i;
+}
+void Safety_Force()
+{
+  if (GetForce() > Safe_Force)
+  {
+    K1.s(0); //NUKES THE SPEED
+    Safe_Engaged = true;
+    SerialUSB.println("Safety Engaged");
+    SerialUSB.println("Safety Engaged: Use More Coarse Coffee or Less Agressive Pattern");
+  }
+  else if (GetForce() <= Safe_Force)
+  {
+  
+  }
+  yield();
+}
+//---Weight Overlay End----------------------
+void SaveShot(ShotPull Alpha)
+{
+  String Name = String(Alpha.Name);
+  byte    *buff = (byte *) &Alpha;
+  delay(10.0);
+  SerialUSB.println("Post YIled1");
+  //strcpy( fname, Name);
+  sdfile = SD.open( Name, FILE_WRITE );
+  if ( !sdfile )
+  {
+    SerialUSB.print( F( "Unable to open for write: " ));
+    SerialUSB.println( Name );
+    while ( 1 ); // sketch stops if reach here
+  }
+  if ( !sdfile.seek( 0 ))
+  {
+    SerialUSB.print( F( "Unable to set seek: " ));
+    SerialUSB.println( Name);
+    while ( 1 ); // sketch stops if reach here
+  }
+  count = sdfile.write( (byte *) &Alpha, sizeof( Alpha ));
+  if ( count != sizeof( ShotPull ))
+  {
+    SerialUSB.print( F( "Unable to write the example block to " ));
+    SerialUSB.println( Name );
+    SerialUSB.print( count, DEC );
+    SerialUSB.println( F( " bytes written." ));
+    while ( 1 ); // sketch stops if reach here
+  }
+  sdfile.close();
+  SerialUSB.println("File" + Name + "Has Been Saved");
+  delay(10.0);
+  SerialUSB.println("Post YIled1");
+}
+
+void LoadShot(String Name)
+{
+  sdfile = SD.open( Name, FILE_READ );
+  byte * p = (byte*) &Current_Setting;
+  for ( int count = 0; count < sdfile.size(); count++ )
+  {
+    if ( sdfile.available())
+    {
+      *p++ = sdfile.read();
+    }
+    else
+    {
+      SerialUSB.print( F( "Unable to read the example block in " ));
+      SerialUSB.println( Name);
+      SerialUSB.print( count, DEC );
+      SerialUSB.println( F( " bytes read." ));
+      while ( 1 ); // sketch stops if reach here
+    }
+  }
+  SerialUSB.print("Pre Delay");
+  ProfileString(Current_Setting);
+  Current_Setting = ScalePot(Current_Setting);
+  SerialUSB.print("POST");
+  delay(10.0);
+}
+
+ShotPull SetProfile(ShotPull Alpha)
+{
+     yield();
+    SerialUSB.println("Set Profile");
+    yield();
+    delay(10.0);
+    SerialUSB.println("Sample" + String(Alpha.SampleRate));
+    delay(10.0);
+  String NewPos;
+  int Samples = (Alpha.Time + 1) * Alpha.SampleRate;
+  if (Samples > sizeof(Alpha.ShotProfile))
+  {
+    SerialUSB.println("Sampling Too long, Will continue but it will be Truncated");
+  }
+  float Delay = 1000.000 / Alpha.SampleRate;
+  SerialUSB.println("Delay" + String(Delay));
+  SerialUSB.println("Samples" + String(Samples));
+  SerialUSB.println("Begin Moving Handle");
+  
+  for (int i = 0; i < Samples; i ++)
+  {
+    unsigned long T0 = millis();
+    if(i == 0)
+    {
+      SerialUSB.println("Init");
+    }
+    int Reading = K1.getp().value();
+    SerialUSB.println(String(Reading));
+    Alpha.ShotProfile[i] = Reading;
+    while(millis()-T0<Delay)
+    {
+      
+    }
+  }
+  SerialUSB.println("Set Profile End Sequence");
+  return Alpha;
+}
+
+ShotPull ProfileShot(float ShotTime, int SampleSeconds)
+{
+  yield();
+  SerialUSB.println("Profile Shot");
+  ShotPull Alpha;
+  Alpha.Time = ShotTime;
+  Alpha.Min = K1.getMin().value();
+  Alpha.Max = K1.getMax().value();
+  Alpha.SampleRate = SampleSeconds;
+  Alpha = SetProfile(Alpha);
+  return Alpha;
+}
+
+void CreateShot(String ProfileName, float ShotTime, int SampleSeconds)
+{
+  String CreateShotOrder = "";
+  long minimum = K1.getMin().value();
+  long maximum = K1.getMax().value();
+  long speed   = (maximum - minimum) / 20; 
+  long Mid = (maximum + minimum)/2;
+  SerialUSB.println("Creating New Shot, Please Place a Cup under Grouphead, Say Yes To continue, Anything to Cancel");
+  while (SerialUSB.available() == 0)
+  {
+    yield();
+  }
+  CreateShotOrder = SerialUSB.readString();
+  SerialUSB.println(CreateShotOrder);
+  if (CreateShotOrder == "Yes")
+  {
+    SerialUSB.println(String(K1.getMin().value()*1.1)+"val"+String(K1.getp().value()));
+    K1.p(K1.getMin().value()*1.1, speed).wait();
+    SerialUSB.println(String(K1.getMin().value()*1.1)+"val"+String(K1.getp().value()));
+    SerialUSB.println("Creating New Shot, Remove Top Pin, and Lower Lever to Bottom. Say Yes Once complete, Anything to Cancel");
+    while (SerialUSB.available() == 0)
+    {
+      yield();
+    }
+    CreateShotOrder = SerialUSB.readString();
+    if (CreateShotOrder == "Yes")
+    {
+      SerialUSB.println("Begining Sequence");
+      yield();
+      ShotPull Alpha = ProfileShot(ShotTime, SampleSeconds);
+      ProfileName.toCharArray(Alpha.Name,100);
+      SaveShot(Alpha);
+    }
+    else
+    {
+      SerialUSB.println("Exiting Create Shot Condition 2");
+    }
+  }
+  else
+  {
+    SerialUSB.println("Exiting Create Shot Condition 1");
+  }
+  SerialUSB.println("Exiting Create Shot Condition 2");
+  K1.p(Mid, speed).wait();
+  SerialUSB.println("Exiting Create Shot Condition 4");
+  yield();
+}
+
+ShotPull ScalePot(ShotPull Alpha)  //Take min max of Pot, map values of shot onto that
+{
+  int SysMin = K1.getMin().value();
+  int SysMax = K1.getMax().value();
+  for (int iterations = 0; iterations < Alpha.Time * Alpha.SampleRate;  iterations ++)
+  {
+      Alpha.ShotProfile[iterations] = map(Alpha.ShotProfile[iterations], Alpha.Min, Alpha.Max, SysMin, SysMax);
+  }
+  Alpha.Min = SysMin;
+  Alpha.Max = SysMax;
+  SerialUSB.println("New String");
+  SerialUSB.println(ProfileString(Alpha)); 
+  return Alpha;
+}
+void PlayShot(ShotPull Alpha)
+{
+  SerialUSB.print("Begining Shot");
+  long Delay = 1000.000 / Alpha.SampleRate;
+  for (int iterations = 0; iterations < Alpha.Time * Alpha.SampleRate;  iterations ++)
+  {
+    SerialUSB.print("Play Shot:Sample " + iterations); 
+    SendShot(Alpha.ShotProfile[iterations], Delay);
+    delay(Delay);
+  }
+}
+void SendShot(long Position, long MoveTime) //Add in boolean Safety, Only run if safety is Disengaged
+{
+  if (!Safe_Engaged)
+  {
+
+    K1.p(Position, MoveTime).wait();
+    SerialUSB.print("Moving Position");
+    //int Delta = Position - K1.getP().value();  //INCREMENT Position
+  }
+  if (Safe_Engaged)
+  {
+    SerialUSB.println("Safety Is Engaged");
+  }
+}
+//---Kangroo Pot Reader End------------------
+
+
+//---Control Schema Begin--------------------
+
+void printDirectory(File dir, int numTabs) {
+  SerialUSB.print("Printing dir");
+  while (true) {
+    delay(2.0);
+    File entry =  dir.openNextFile();
+    if (! entry) {
+      // no more files
+      break;
+    }
+    for (uint8_t i = 0; i < numTabs; i++) {
+      SerialUSB.print('\t');
+    }
+    SerialUSB.print(entry.name());
+    if (entry.isDirectory()) {
+      SerialUSB.println("/");
+      printDirectory(entry, numTabs + 1);
+    } else {
+      // files have sizes, directories do not
+      SerialUSB.print("\t\t");
+      SerialUSB.println(entry.size(), DEC);
+    }
+    entry.close();
+  }
+}
+
+String ProfileString(ShotPull Alpha)
+{
+  String Profile = "";
+  SerialUSB.print("Starting Conversion");
+  for(int i = 0; i < ((Alpha.Time) * Alpha.SampleRate); i ++)
+  {
+    Profile += String(Alpha.ShotProfile[i])+",";
+    delay(5.0);
+  }
+  SerialUSB.print("Ending Conversion");
+  delay(5.0);
+  return Profile;
+}
+
+void CommandChecker()
+{
+  //SerialUSB.println("This is the Command" + CommandString);
+  String Command = CommandString;
+  if (Command == "Stop")
+  {
+    Safe_ToBrew = false;
+    CommandString = "";
+    SerialUSB.println("System Disabled");
+  }
+  else if (Command == "Enable")
+  {
+    SerialUSB.println("System Enabled");
+    Safe_ToBrew = true;
+    CommandString = "";
+  }
+  else if (Safe_ToBrew == false)
+  {
+    if (Command == "New Profile")
+    {
+      Block = true;
+      String NewFile = "";
+      float ShotTime = 0.0;
+      int SampleSeconds = 0;
+      String Temp;
+      SerialUSB.println("Please Enter Profile Name:");
+      while (SerialUSB.available() == 0)
+      {
+        yield();
+      }
+      NewFile = SerialUSB.readString();
+      SerialUSB.println("New File" + NewFile);
+
+      SerialUSB.println("Please Enter Shot Time:");
+
+      while (SerialUSB.available() == 0)
+      {
+        yield();
+      }
+      while (SerialUSB.available())
+      {
+        Temp += SerialUSB.readString();
+      }
+      ShotTime = Temp.toInt();
+      SerialUSB.println("Please Enter Sample Rate:");
+      Temp = "";
+      while (SerialUSB.available() == 0)
+      {
+        yield();
+      }
+      while (SerialUSB.available())
+      {
+        Temp += SerialUSB.readString();
+      }
+      SampleSeconds = Temp.toInt();
+
+      CreateShot(NewFile, ShotTime, SampleSeconds);
+      SerialUSB.println("New File: " + NewFile);
+      SerialUSB.println("Shot Time: " + String(ShotTime));
+      SerialUSB.println("SampleSeconds: " + String(SampleSeconds));
+      CommandString = "";
+      Block = false;
+    }
+    else if (Command == "Load Profile")
+    {
+      Command ="";
+      Block = true;
+      String LoadProfileName = "";
+      SerialUSB.println("Please Enter Profile");
+      while (SerialUSB.available() == 0)
+      {
+        yield();
+      }
+      while (SerialUSB.available())
+      {
+        LoadProfileName  += SerialUSB.readString();
+      }
+      delay(15.0);
+      LoadShot(LoadProfileName);
+      SerialUSB.println(LoadProfileName + "Profile Loaded");
+      CommandString = "";
+      Block = false;
+    }
+    else if (Command == "List Profile")
+    {
+      File root = SD.open("/");
+      printDirectory(root, 0);
+      SerialUSB.println("done!");
+      root.close();
+      CommandString = "";
+      yield();
+    }
+    else if (Command == "Current Profile")
+    {
+      delay(15.0);
+      SerialUSB.print("Current Profile:");
+      delay(5.0);
+      Current_Setting = ScalePot(Current_Setting);
+      CommandString = "";
+      yield();
+    }
+    else if (Command == "Play Shot")
+    {
+      SerialUSB.println("Begining Experience");
+      PlayShot(Current_Setting);
+      SerialUSB.println("Experience Complete");
+    }
+    CommandString = "";
+    yield();
+  }
+  yield();
+}
+//---Control Schema End-----
+
+void heartbeat()
+{
+    SerialUSB.println("System Heartbeat,SysUUID," + myMac + ",Sysconfig," + MyConfig);
+    yield();
+    delay(10000);
+}
+void setup()
+{
+  serialInit();
+  macInit();
+  initIpAddress();
+  tcpClientConnect();
+  InitMotor();
+  InitSD();
+  InitLoadCell();
+  analogReadResolution(12);
+  Scheduler.startLoop(ipStatusCheck);
+  Scheduler.startLoop(printIPAddress);
+  Scheduler.startLoop(tcpClientStatus);
+  Scheduler.startLoop(tcpReceive);
+  Scheduler.startLoop(ProbeSerial);
+  Scheduler.startLoop(heartbeat);
+  Scheduler.startLoop(Safety_Force);
+  //Scheduler.startLoop(CommandChecker);
+}
+
+void loop()
+{
+ 
+  //SerialUSB.println("System Heartbeat,SysUUID," + myMac + ",Sysconfig," + MyConfig);
+  CommandChecker();
+ // SerialUSB.println(String(K1.getMin().value())+"val"+String(K1.getp().value()));
+  yield();
+  delay(5.0);
+ // ipStatusCheck();
+ // printIPAddress();
+ // tcpClientStatus();
+}
